@@ -68,21 +68,49 @@ class FileDialog(
         return if (has) uri else null
     }
 
-    private fun persistTreeUri(uri: Uri, takeFlags: Int) {
-        val a = activity ?: return
-        try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.KITKAT) {
-                a.contentResolver.takePersistableUriPermission(
-                    uri,
-                    takeFlags and (Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
-                )
-            }
-        } catch (se: SecurityException) {
-            Log.w(LOG_TAG, "takePersistableUriPermission failed: ${se.message}")
-        }
+private fun persistTreeUri(uri: Uri, takeFlagsFromResult: Int): Boolean {
+    val act = activity ?: return false
+    val cr = act.contentResolver
+
+    // Use only READ/WRITE bits from the returned flags
+    val masked = takeFlagsFromResult and
+            (Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
+
+    fun saveAndPrune() {
+        // store the URI only after a successful persist
         prefs()?.edit()?.putString(KEY_TREE_URI, uri.toString())?.apply()
+        // optional: release other grants to avoid hitting limits
+        try {
+            cr.persistedUriPermissions
+                .filter { it.uri != uri }
+                .forEach { perm ->
+                    try { cr.releasePersistableUriPermission(perm.uri, perm.modeFlags) } catch (_: Exception) {}
+                }
+        } catch (_: Exception) {}
         Log.d(LOG_TAG, "Persisted tree URI: $uri")
     }
+
+    return try {
+        cr.takePersistableUriPermission(uri, masked)
+        saveAndPrune()
+        true
+    } catch (se: SecurityException) {
+        Log.w(LOG_TAG, "takePersistableUriPermission (masked) failed: ${se.message}")
+        // Some pickers misreport flags — try explicit READ|WRITE as a fallback
+        try {
+            cr.takePersistableUriPermission(
+                uri,
+                Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+            )
+            saveAndPrune()
+            true
+        } catch (se2: SecurityException) {
+            Log.w(LOG_TAG, "takePersistableUriPermission (fallback) failed: ${se2.message}")
+            false
+        }
+    }
+}
+
 
     fun pickDirectory(result: MethodChannel.Result) {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.LOLLIPOP) {
@@ -122,7 +150,8 @@ class FileDialog(
             addFlags(
                 Intent.FLAG_GRANT_READ_URI_PERMISSION or
                 Intent.FLAG_GRANT_WRITE_URI_PERMISSION or
-                Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION
+                Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION or
+                Intent.FLAG_GRANT_PREFIX_URI_PERMISSION
             )
         }
         activity?.startActivityForResult(intent, REQUEST_CODE_PICK_DIR)
@@ -258,14 +287,10 @@ class FileDialog(
         when (requestCode) {
             REQUEST_CODE_PICK_DIR -> {
                 if (resultCode == Activity.RESULT_OK && data?.data != null) {
-                    val sourceFileUri = data.data!!
-                    Log.d(LOG_TAG, "Picked directory: $sourceFileUri")
-
-                    // Take & persist permission, then remember for future calls
-                    val takeFlags = data.flags
-                    persistTreeUri(sourceFileUri, takeFlags)
-
-                    finishSuccessfully(sourceFileUri.toString())
+             val uri = data.data!!
+        val ok = persistTreeUri(uri, data.flags)
+        if (ok) {
+            finishSuccessfully(uri.toString())
                 } else {
                     Log.d(LOG_TAG, "Cancelled")
                     finishSuccessfully(null)
