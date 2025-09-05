@@ -26,6 +26,9 @@ private const val REQUEST_CODE_PICK_DIR = 19110
 private const val REQUEST_CODE_PICK_FILE = 19111
 private const val REQUEST_CODE_SAVE_FILE = 19112
 
+private const val PREFS_NAME = "flutter_file_dialog_prefs"
+private const val KEY_TREE_URI = "persisted_tree_uri"
+
 // https://developer.android.com/guide/topics/providers/document-provider
 // https://developer.android.com/reference/android/content/Intent.html#ACTION_CREATE_DOCUMENT
 // https://android.googlesource.com/platform/development/+/master/samples/ApiDemos/src/com/example/android/apis/content/DocumentsSample.java
@@ -43,6 +46,42 @@ class FileDialog(
 
     fun setActivity(activity: Activity?) {
         this.activity = activity
+    }
+
+    // -------------------------
+    // Persistence helpers
+    // -------------------------
+    private fun prefs(): android.content.SharedPreferences? {
+        val a = activity ?: return null
+        return a.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+    }
+
+    private fun getPersistedTreeUri(): Uri? {
+        val a = activity ?: return null
+        val s = prefs()?.getString(KEY_TREE_URI, null) ?: return null
+        val uri = Uri.parse(s)
+
+        // Make sure we still hold the persistable permission (user may revoke)
+        val has = a.contentResolver.persistedUriPermissions.any {
+            it.uri == uri && it.isReadPermission && it.isWritePermission
+        }
+        return if (has) uri else null
+    }
+
+    private fun persistTreeUri(uri: Uri, takeFlags: Int) {
+        val a = activity ?: return
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.KITKAT) {
+                a.contentResolver.takePersistableUriPermission(
+                    uri,
+                    takeFlags and (Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
+                )
+            }
+        } catch (se: SecurityException) {
+            Log.w(LOG_TAG, "takePersistableUriPermission failed: ${se.message}")
+        }
+        prefs()?.edit()?.putString(KEY_TREE_URI, uri.toString())?.apply()
+        Log.d(LOG_TAG, "Persisted tree URI: $uri")
     }
 
     fun pickDirectory(result: MethodChannel.Result) {
@@ -70,7 +109,22 @@ class FileDialog(
             return
         }
 
-        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT_TREE)
+        // If we already have a persisted folder, return it immediately (no UI)
+        getPersistedTreeUri()?.let { persisted ->
+            Log.d(LOG_TAG, "pickDirectory - returning persisted: $persisted")
+            finishSuccessfully(persisted.toString())
+            Log.d(LOG_TAG, "pickDirectory - OUT (persisted)")
+            return
+        }
+
+        // Otherwise prompt once and ask for persistable permission
+        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT_TREE).apply {
+            addFlags(
+                Intent.FLAG_GRANT_READ_URI_PERMISSION or
+                Intent.FLAG_GRANT_WRITE_URI_PERMISSION or
+                Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION
+            )
+        }
         activity?.startActivityForResult(intent, REQUEST_CODE_PICK_DIR)
 
         Log.d(LOG_TAG, "pickDirectory - OUT")
@@ -151,13 +205,20 @@ class FileDialog(
             sourceFile!!.writeBytes(data!!)
         }
 
-        val intent = Intent(Intent.ACTION_CREATE_DOCUMENT)
-        intent.addCategory(Intent.CATEGORY_OPENABLE)
-        intent.putExtra(Intent.EXTRA_TITLE, fileName ?: sourceFile!!.name)
-        if (localOnly) {
-            intent.putExtra(Intent.EXTRA_LOCAL_ONLY, true)
+        val intent = Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE)
+            putExtra(Intent.EXTRA_TITLE, fileName ?: sourceFile!!.name)
+            if (localOnly) {
+                putExtra(Intent.EXTRA_LOCAL_ONLY, true)
+            }
+            applyMimeTypesFilterToIntent(mimeTypesFilter, this)
+            // recommend persistable flags here as well (provider may allow take later)
+            addFlags(
+                Intent.FLAG_GRANT_READ_URI_PERMISSION or
+                Intent.FLAG_GRANT_WRITE_URI_PERMISSION or
+                Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION
+            )
         }
-        applyMimeTypesFilterToIntent(mimeTypesFilter, intent)
 
         if (activity == null) {
             finishWithError(
@@ -197,9 +258,14 @@ class FileDialog(
         when (requestCode) {
             REQUEST_CODE_PICK_DIR -> {
                 if (resultCode == Activity.RESULT_OK && data?.data != null) {
-                    val sourceFileUri = data.data
+                    val sourceFileUri = data.data!!
                     Log.d(LOG_TAG, "Picked directory: $sourceFileUri")
-                    finishSuccessfully(sourceFileUri!!.toString())
+
+                    // Take & persist permission, then remember for future calls
+                    val takeFlags = data.flags
+                    persistTreeUri(sourceFileUri, takeFlags)
+
+                    finishSuccessfully(sourceFileUri.toString())
                 } else {
                     Log.d(LOG_TAG, "Cancelled")
                     finishSuccessfully(null)
@@ -234,8 +300,21 @@ class FileDialog(
             }
             REQUEST_CODE_SAVE_FILE -> {
                 if (resultCode == Activity.RESULT_OK && data?.data != null) {
-                    val destinationFileUri = data.data
-                    saveFileOnBackground(this.sourceFile!!, destinationFileUri!!)
+                    val destinationFileUri = data.data!!
+                    // Some providers also allow taking persistable permission on created file
+                    val takeFlags = data.flags
+                    try {
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.KITKAT) {
+                            activity?.contentResolver?.takePersistableUriPermission(
+                                destinationFileUri,
+                                takeFlags and (Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
+                            )
+                        }
+                    } catch (se: SecurityException) {
+                        Log.w(LOG_TAG, "takePersistableUriPermission (file) failed: ${se.message}")
+                    }
+
+                    saveFileOnBackground(this.sourceFile!!, destinationFileUri)
                 } else {
                     Log.d(LOG_TAG, "Cancelled")
                     if (isSourceFileTemp) {
@@ -369,9 +448,14 @@ class FileDialog(
         Log.d(LOG_TAG, "Saving file '${sourceFile.path}' to '${destinationFileUri.path}'")
         sourceFile.inputStream().use { inputStream ->
             activity?.contentResolver?.openOutputStream(destinationFileUri).use { outputStream ->
-                outputStream as java.io.FileOutputStream
-                outputStream.channel.truncate(0)
+                if (outputStream == null) {
+                    throw IllegalStateException("openOutputStream returned null for $destinationFileUri")
+                }
+                // Do not force-cast; some providers don't return FileOutputStream.
+                // Many providers create a fresh file; if you need truncation semantics,
+                // open with "wt" mode via DocumentsContract.openDocument (not shown).
                 inputStream.copyTo(outputStream)
+                outputStream.flush()
             }
         }
         Log.d(LOG_TAG, "Saved file to '${destinationFileUri.path}'")
